@@ -14,18 +14,18 @@ import (
 )
 
 func NewRedisGraph(options *redis.Options) (gographer.Graph, error) {
-	return RedisNodeStore{
+	return SingleDependencyGraph{
 		ctx:   context.Background(),
 		redis: redis.NewClient(options),
 	}, nil
 }
 
-type RedisNodeStore struct {
+type SingleDependencyGraph struct {
 	redis *redis.Client
 	ctx   context.Context
 }
 
-func (r RedisNodeStore) StoreNode(node gographer.Node) (identifier string, result bool, err error) {
+func (r SingleDependencyGraph) StoreNode(node gographer.Node) (identifier string, result bool, err error) {
 	key := nodeIdToNodeKey(node.Id)
 	count, err := r.redis.Exists(r.ctx, key).Result()
 	if err != nil {
@@ -52,7 +52,7 @@ func (r RedisNodeStore) StoreNode(node gographer.Node) (identifier string, resul
 	return key, result, r.redis.Set(r.ctx, key, data, 0).Err()
 }
 
-func (r RedisNodeStore) StoreRelation(relation gographer.Relation) (identifier string, result bool, err error) {
+func (r SingleDependencyGraph) StoreRelation(relation gographer.Relation) (identifier string, result bool, err error) {
 	parentKey := nodeIdToParentRelationKey(relation.Host)
 	childKey := nodeIdToChildRelationKey(relation.Target)
 
@@ -92,7 +92,7 @@ func (r RedisNodeStore) StoreRelation(relation gographer.Relation) (identifier s
 	return parentKey, result, nil
 }
 
-func (r RedisNodeStore) RetrieveNode(id string, typeOf interface{}) (node *gographer.Node, err error) {
+func (r SingleDependencyGraph) RetrieveNode(id string, typeOf interface{}) (node *gographer.Node, err error) {
 	key := nodeIdToNodeKey(id)
 
 	count, err := r.redis.Exists(r.ctx, key).Result()
@@ -121,18 +121,56 @@ func (r RedisNodeStore) RetrieveNode(id string, typeOf interface{}) (node *gogra
 	return node, nil
 }
 
-func (r RedisNodeStore) DeleteNode(id string) (err error) {
-	key := nodeIdToNodeKey(id)
-	// todo: clean up the relations
-	return r.redis.Del(r.ctx, key).Err()
+func (r SingleDependencyGraph) DeleteNode(id string) (err error) {
+	nodeId := nodeKeyToNodeId(id)
+	relations := r.RelatedNodes(nodeId)
+	for relation := range relations {
+		if relation.Host == nodeId {
+			err = r.DeleteRelation(nodeId, nodeKeyToNodeId(relation.Target))
+		} else {
+			err = r.DeleteRelation(nodeKeyToNodeId(relation.Host), nodeId)
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	err = r.redis.Del(r.ctx, nodeIdToNodeKey(id)).Err()
+
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
-func (r RedisNodeStore) DeleteRelation(host string, target string) (err error) {
-	// todo: implement relation delete
-	panic("implement Redis#DeleteRelation")
+func (r SingleDependencyGraph) DeleteRelation(host string, target string) (err error) {
+	parentRelationKey := nodeIdToParentRelationKey(host)
+	childRelationKey := nodeIdToChildRelationKey(target)
+	parentKeysToDelete := make([]string, 0)
+
+	data, err := r.redis.HGetAll(r.ctx, parentRelationKey).Result()
+	for k := range data {
+		if k == fmt.Sprintf("target:%s", nodeKeyToNodeId(target)) {
+			parentKeysToDelete = append(parentKeysToDelete, k)
+		}
+		if strings.HasPrefix("meta:%s:", nodeKeyToNodeId(target)) {
+			parentKeysToDelete = append(parentKeysToDelete, k)
+		}
+	}
+	_, err = r.redis.HDel(r.ctx, parentRelationKey, parentKeysToDelete...).Result()
+	if err != nil {
+		return err
+	}
+
+	_, err = r.redis.SRem(r.ctx, childRelationKey, nodeKeyToNodeId(host)).Result()
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func (r RedisNodeStore) RelatedNodes(nodeId string) <-chan gographer.Relation {
+func (r SingleDependencyGraph) RelatedNodes(nodeId string) <-chan gographer.Relation {
 	returnChan := make(chan gographer.Relation)
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -157,7 +195,7 @@ func (r RedisNodeStore) RelatedNodes(nodeId string) <-chan gographer.Relation {
 	return returnChan
 }
 
-func (r RedisNodeStore) ChildNodes(nodeId string) <-chan gographer.Relation {
+func (r SingleDependencyGraph) ChildNodes(nodeId string) <-chan gographer.Relation {
 	if strings.HasPrefix(nodeId, "node:") {
 		nodeId = strings.TrimPrefix(nodeId, "node:")
 	}
@@ -198,7 +236,7 @@ func (r RedisNodeStore) ChildNodes(nodeId string) <-chan gographer.Relation {
 	return resultChan
 }
 
-func (r RedisNodeStore) ParentNodes(nodeId string) <-chan gographer.Relation {
+func (r SingleDependencyGraph) ParentNodes(nodeId string) <-chan gographer.Relation {
 	parents := make(chan gographer.Relation)
 	ids, err := r.redis.SMembers(r.ctx, nodeIdToChildRelationKey(nodeId)).Result()
 	if err != nil {
@@ -230,9 +268,19 @@ func (r RedisNodeStore) ParentNodes(nodeId string) <-chan gographer.Relation {
 	return parents
 }
 
-func (r RedisNodeStore) NodesMatchingMetadata(nodeId string, key string, value string) <-chan gographer.Relation {
-	//TODO implement me
-	panic("implement me")
+func (r SingleDependencyGraph) NodesMatchingMetadata(nodeId string, key string, value string) <-chan gographer.Relation {
+	returnChan := make(chan gographer.Relation)
+	go func(relations <-chan gographer.Relation, results chan gographer.Relation) {
+		for relation := range relations {
+			if val, ok := relation.Metadata[key]; ok {
+				if val == value {
+					results <- relation
+				}
+			}
+		}
+		close(results)
+	}(r.RelatedNodes(nodeKeyToNodeId(nodeId)), returnChan)
+	return returnChan
 }
 
 func nodeIdToNodeKey(id string) (key string) {
